@@ -9,125 +9,19 @@
 #include <stdint.h>
 #include <string.h>
 #include <usb/usb_host.h>
-#include <usb/usb_types_ch9.h>
 
+#include "hid_host.h"
+#include "hid_usage_keyboard.h"
 #include "tasks_common.h"
 
 static const char TAG[] = "usb_app";
 
-static void client_event_cb(const usb_host_client_event_msg_t *msg, void *args) {
-    class_driver_control_t *class_driver_obj = (class_driver_control_t*)args;
-    switch (msg->event) {
-        case USB_HOST_CLIENT_EVENT_NEW_DEV:
-            class_driver_obj->actions |= CLASS_DRIVER_ACTION_OPEN_DEV;
-            class_driver_obj->dev_addr = msg->new_dev.address;
-            break;
-        case USB_HOST_CLIENT_EVENT_DEV_GONE:
-            class_driver_obj->actions |= CLASS_DRIVER_ACTION_CLOSE_DEV;
-            break;
-        default:
-            break;
-    }
-}
-
-static void transfer_cb(usb_transfer_t *transfer) {
-    class_driver_control_t *class_driver_obj = (class_driver_control_t*)transfer->context;
-    printf("Transfer status %d, actual number of bytes transferred %d\n", transfer->status, transfer->actual_num_bytes);
-
-    if (transfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-        ESP_LOGE(TAG, "Transmition failed. Error code: %d", transfer->status);
-        return;
-    }
-
-    if (transfer->actual_num_bytes >= 8) {
-
-        // Get the pressed modifier key (shirt, ctrl, etc.)
-        const uint8_t modifier = transfer->data_buffer[0];
-        ESP_LOGI(TAG, "MODIFIER KEY: 0x%02X", modifier);
-
-        // Get the pressed normal key
-        for (int i = 2; i < 8; i++) {
-            const uint8_t key_code = transfer->data_buffer[i];
-            ESP_LOGI(TAG, "PRESSED KEY: %d", key_code);
-        }
-    } else {
-        ESP_LOGE(TAG, "Transmition failed! Transfer contains only %d bytes", transfer->actual_num_bytes);
-    }
-}
-
-/*
- * Returns 0xFF if no address is found
- */
-static uint8_t find_IN_endpoint_addr(usb_config_desc_t *config_desc, const usb_intf_desc_t *intf_desc, int *intf_index) {
-    const usb_ep_desc_t *ep_desc;
-    for (int i = 0; i < intf_desc->bNumEndpoints; i++) {
-        ep_desc = usb_parse_endpoint_descriptor_by_index(intf_desc, i, config_desc->wTotalLength, intf_index);
-        if (!ep_desc) {
-            ESP_LOGE(TAG, "Failed to parse endpoint descriptor!");
-            return 0xFF;
-        }
-
-        bool isIN = ep_desc->bEndpointAddress & USB_EP_DIR_IN &&
-            (ep_desc->bmAttributes & USB_BM_ATTRIBUTES_XFER_MASK) == USB_BM_ATTRIBUTES_XFER_INT;
-
-        if (isIN) {
-            ESP_LOGI(TAG, "Interrupt IN endpoint found: 0x%02X", ep_desc->bEndpointAddress);
-            return ep_desc->bEndpointAddress;
-        }
-    }
-
-    ESP_LOGW(TAG, "No Interrupt IN endpoint found!");
-    return 0xFF;
-}
-
-static usb_app_check_keyboard_result_t check_for_keyboard_device(class_driver_control_t *class_driver_obj) {
-    usb_app_check_keyboard_result_t result = {
-        .is_keyboard = false,
-        .endpoint_IN_addr = 0xFF,
-        .interface_number = 0xFF
-    };
-    usb_device_desc_t *device_desc;
-    usb_config_desc_t *config_desc;
-    const usb_intf_desc_t *intf_desc;
-    uint8_t endpoint_IN_addr = 0xFF;
-
-    esp_err_t err = usb_host_get_device_descriptor(class_driver_obj->device_handle, &device_desc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get device descriptor! %s", esp_err_to_name(err));
-        return result;
-    }
-
-    err = usb_host_get_config_desc(class_driver_obj->client_handle, class_driver_obj->device_handle, 0, &config_desc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get config descriptor! %s", esp_err_to_name(err));
-        return result;
-    }
-
-    for (int i = 0; i < config_desc->bNumInterfaces; i++) {
-        intf_desc = usb_parse_interface_descriptor(config_desc, i, 0, NULL);
-        const bool is_keyboard = intf_desc != NULL &&
-            intf_desc->bInterfaceClass == USB_HID_CLASS &&
-            intf_desc->bInterfaceSubClass == USB_BOOT_INTERFACE_SUBCLASS &&
-            intf_desc->bInterfaceProtocol == USB_KEYBOARD_PROTOCOL;
-
-        if (is_keyboard) {
-            result.is_keyboard = true;
-            result.interface_number = intf_desc->bInterfaceNumber;
-            ESP_LOGI(TAG, "Found HID Keyboard at Interface %d", result.interface_number);
-            if ((endpoint_IN_addr = find_IN_endpoint_addr(config_desc, intf_desc, &i)) == 0xFF) {
-                ESP_LOGE(TAG, "Failed to find IN endpoint address!");
-            }
-            result.endpoint_IN_addr = endpoint_IN_addr;
-            break;
-        }
-    }
-    if (!result.is_keyboard) ESP_LOGE(TAG, "No HID Keyboard is found!");
-
-    usb_host_free_config_desc(config_desc);
-    return result;
-}
+QueueHandle_t usb_app_event_queue = NULL;
 
 static void daemon_task(void *args) {
+    ESP_LOGI(TAG, "Starting USB daemon task...");
+    TaskHandle_t *notify_task_handle = (TaskHandle_t *)args;
+
     usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1
@@ -135,17 +29,17 @@ static void daemon_task(void *args) {
     ESP_ERROR_CHECK(usb_host_install(&host_config));
 
     // Send signal that host is installed
-    xTaskNotifyGive(args);
+    xTaskNotifyGive(notify_task_handle);
 
-    bool has_clients = true;
-    bool has_devices = true;
-    while (has_clients || has_devices) {
+    while (1) {
         uint32_t event_flags;
+
         esp_err_t err = usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to handle USB Host Library events");
             continue;
         }
+
         if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
             ESP_LOGI(TAG, "No more USB Clients!");
             if (ESP_OK == usb_host_device_free_all()) {
@@ -153,115 +47,192 @@ static void daemon_task(void *args) {
             } else {
                 ESP_LOGI(TAG, "Waiting for ALL_FREE Event...");
             }
-            has_clients = false;
-        }
-        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
-            ESP_LOGI(TAG, "No more USB Devices connected!");
-            has_devices = false;
         }
     }
 
     ESP_LOGI(TAG, "No more USB Clients and Devices!");
-
     ESP_ERROR_CHECK(usb_host_uninstall());
     vTaskSuspend(NULL);
 }
 
-static void client_task(void *args) {
-    class_driver_control_t class_driver_obj = {0};
-    const usb_host_client_config_t client_config = {
-        .is_synchronous = false,
-        .max_num_event_msg = 3,
-        .async = {
-            .client_event_callback = client_event_cb,
-            .callback_arg = &class_driver_obj
+static bool key_found(const uint8_t *const src,
+                             uint8_t key,
+                             unsigned int length)
+{
+    for (unsigned int i = 0; i < length; i++) {
+        if (src[i] == key) {
+            return true;
         }
-    };
-    ESP_ERROR_CHECK(usb_host_client_register(&client_config, &class_driver_obj.client_handle));
-    usb_transfer_t *transfer;
-    ESP_ERROR_CHECK(usb_host_transfer_alloc(8, 0, &transfer));
+    }
+    return false;
+}
 
-    bool has_device = true;
-    while (has_device) {
-        esp_err_t err = usb_host_client_handle_events(class_driver_obj.client_handle, portMAX_DELAY);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to handle USB Client event! %s", esp_err_to_name(err));
-            continue;
-        }
+static void hid_host_keyboard_report_callback(const uint8_t *const data, const int length) {
+    hid_keyboard_input_report_boot_t *kb_report = (hid_keyboard_input_report_boot_t*) data;
 
-        // If device is connected
-        if (class_driver_obj.actions & CLASS_DRIVER_ACTION_OPEN_DEV) {
-            err = usb_host_device_open(class_driver_obj.client_handle, class_driver_obj.dev_addr, &class_driver_obj.device_handle);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to open device! %s", esp_err_to_name(err));
-                break;
-            }
+    if (length < sizeof(hid_keyboard_input_report_boot_t)) {
+        return;
+    }
 
-            const usb_app_check_keyboard_result_t res = check_for_keyboard_device(&class_driver_obj);
-            if (!res.is_keyboard || res.endpoint_IN_addr == 0xFF || res.interface_number == 0xFF) break;
-            class_driver_obj.device_endpoint_IN_addr = res.endpoint_IN_addr;
+    static uint8_t prev_keys[HID_KEYBOARD_KEY_MAX] = { 0 };
+    key_event_t key_event;
 
-            err = usb_host_interface_claim(class_driver_obj.client_handle, class_driver_obj.device_handle, res.interface_number, 0);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to claim interface! %s", esp_err_to_name(err));
-                break;
-            }
+    for (int i = 0; i < HID_KEYBOARD_KEY_MAX; i++) {
+        // Key has been released
+        if (prev_keys[i] > HID_KEY_ERROR_UNDEFINED && !key_found(kb_report->key, prev_keys[i], HID_KEYBOARD_KEY_MAX)) {
+            key_event.key_code = prev_keys[i];
+            key_event.modifier = 0;
+            key_event.state = KEY_STATE_RELEASED;
+            ESP_LOGI(TAG, "KEY RELEASED");
+            // key_event_callback
         }
 
-        // On transfer
-        if (class_driver_obj.actions & CLASS_DRIVER_ACTION_TRANSFER) {
-            memset(transfer->data_buffer, 0x00, 8); // Clear the buffer
-            transfer->num_bytes = 8;
-            transfer->device_handle = class_driver_obj.device_handle;
-            transfer->bEndpointAddress = class_driver_obj.device_endpoint_IN_addr;
-            transfer->callback = transfer_cb;
-            transfer->context = (void*)&class_driver_obj;
-            usb_host_transfer_submit(transfer);
-        }
-
-        // If device is disconnected
-        if (class_driver_obj.actions & CLASS_DRIVER_ACTION_CLOSE_DEV) {
-            err = usb_host_interface_release(class_driver_obj.client_handle, class_driver_obj.device_handle, 1);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to release interface! %s", esp_err_to_name(err));
-                break;
-            }
-            err = usb_host_device_close(class_driver_obj.client_handle, class_driver_obj.device_handle);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to close device! %s", esp_err_to_name(err));
-                break;
-            }
-            has_device = false;
+        // Key has been pressed
+        if (prev_keys[i] > HID_KEY_ERROR_UNDEFINED && !key_found(prev_keys, kb_report->key[i], HID_KEYBOARD_KEY_MAX)) {
+            key_event.key_code = kb_report->key[i];
+            key_event.modifier = kb_report->modifier.val;
+            key_event.state = KEY_STATE_PRESSED;
+            ESP_LOGI(TAG, "KEY PRESSED");
+            // key_event_callback
         }
     }
 
-    usb_host_transfer_free(transfer);
-    usb_host_client_deregister(class_driver_obj.client_handle);
-    vTaskSuspend(NULL);
+    memcpy(prev_keys, &kb_report->key, HID_KEYBOARD_KEY_MAX);
+}
+
+static void hid_host_interface_callback(
+    hid_host_device_handle_t hid_device_handle,
+    const hid_host_interface_event_t event,
+    void *arg)
+{
+    uint8_t data[64] = { 0 };
+    size_t data_length = 0;
+    hid_host_dev_params_t dev_params;
+    ESP_ERROR_CHECK(hid_host_device_get_params(hid_device_handle, &dev_params));
+
+    switch (event) {
+        case HID_HOST_INTERFACE_EVENT_INPUT_REPORT:
+            ESP_ERROR_CHECK(
+                hid_host_device_get_raw_input_report_data(hid_device_handle, data, 64, &data_length)
+                );
+
+            if (dev_params.sub_class == HID_SUBCLASS_BOOT_INTERFACE) {
+                if (dev_params.proto == HID_PROTOCOL_KEYBOARD) {
+                    hid_host_keyboard_report_callback(data, data_length);
+                }
+            } else {
+                // TODO...
+            }
+        break;
+        case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "HID Device, protocol '%s' DISCONNECTED", hid_proto_name_str[dev_params.proto]);
+            ESP_ERROR_CHECK(hid_host_device_close(hid_device_handle));
+        break;
+        case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
+            ESP_LOGI(TAG, "HID Device, protocol '%s' TRANSFER_ERROR",
+                 hid_proto_name_str[dev_params.proto]);
+        break;
+        default:
+            ESP_LOGE(TAG, "HID Device, protocol '%s' Unhandled event",
+                     hid_proto_name_str[dev_params.proto]);
+        break;
+    }
+}
+
+static void hid_host_device_event(
+    hid_host_device_handle_t hid_device_handle,
+    const hid_host_driver_event_t event,
+    void *arg)
+{
+    hid_host_dev_params_t dev_params;
+    ESP_ERROR_CHECK(hid_host_device_get_params(hid_device_handle, &dev_params));
+
+    switch (event) {
+        case HID_HOST_DRIVER_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "HID Device, protocol '%s' CONNECTED", hid_proto_name_str[dev_params.proto]);
+
+            const hid_host_device_config_t dev_config = {
+                .callback = hid_host_interface_callback,
+                .callback_arg = NULL
+            };
+
+            ESP_ERROR_CHECK(hid_host_device_open(hid_device_handle, &dev_config));
+            if (dev_params.sub_class == HID_SUBCLASS_BOOT_INTERFACE) {
+                ESP_LOGI(TAG, "BOOT SUBCLASS");
+                hid_report_protocol_t protocol = HID_REPORT_PROTOCOL_REPORT;
+                ESP_ERROR_CHECK(hid_class_request_get_protocol(hid_device_handle, &protocol));
+
+                if (dev_params.proto == HID_PROTOCOL_KEYBOARD) {
+                    ESP_ERROR_CHECK(hid_class_request_set_idle(hid_device_handle, 0, 0));
+                }
+            }
+            ESP_ERROR_CHECK(hid_host_device_start(hid_device_handle));
+            break;
+        default:
+            break;
+    }
+}
+
+static void hid_host_device_callback(
+    hid_host_device_handle_t hid_device_handle,
+    const hid_host_driver_event_t event,
+    void *arg)
+{
+    const usb_app_event_queue_t evt_queue = {
+        .event_group = APP_EVENT_HID_HOST,
+        .hid_host_device = {
+            .handle = hid_device_handle,
+            .event = event,
+            .arg = arg
+        }
+    };
+    ESP_LOGI(TAG, "DEVICE NEW");
+    if (usb_app_event_queue) {
+        xQueueSend(usb_app_event_queue, &evt_queue, 0);
+    }
 }
 
 void usb_init() {
+    TaskHandle_t daemon_task_handle = NULL;
 
     // Initialize daemon
     xTaskCreatePinnedToCore(
         daemon_task,
         "daemon_task",
         USB_APP_DEAMON_TASK_STACK_SIZE,
-        NULL,
+        &daemon_task_handle,
         USB_APP_DEAMON_TASK_PRIORITY,
-        NULL,
+        &daemon_task_handle,
         USB_APP_DEAMON_TASK_CORE_ID
     );
     ulTaskNotifyTake(false, 1000);
 
-    // Initialize client
-    xTaskCreatePinnedToCore(
-        client_task,
-        "client_task",
-        USB_APP_CLIENT_TASK_STACK_SIZE,
-        NULL,
-        USB_APP_CLIENT_TASK_PRIORITY,
-        NULL,
-        USB_APP_CLIENT_TASK_CORE_ID
-    );
+    const hid_host_driver_config_t hid_host_driver_config = {
+        .create_background_task = true,
+        .task_priority = USB_APP_HID_TASK_PRIORITY,
+        .stack_size =  USB_APP_HID_TASK_STACK_SIZE,
+        .core_id = USB_APP_HID_TASK_CORE_ID,
+        .callback = hid_host_device_callback,
+        .callback_arg = NULL
+    };
+
+    ESP_ERROR_CHECK(hid_host_install(&hid_host_driver_config));
+
+    usb_app_event_queue = xQueueCreate(10, sizeof(usb_app_event_queue_t));
+
+    usb_app_event_queue_t evt_queue;
+    while (1) {
+        if (xQueueReceive(usb_app_event_queue, &evt_queue, portMAX_DELAY)) {
+            if (evt_queue.event_group == APP_EVENT_HID_HOST) {
+                hid_host_device_event(
+                    evt_queue.hid_host_device.handle,
+                    evt_queue.hid_host_device.event,
+                    evt_queue.hid_host_device.arg);
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "USB Driver uninstall");
+    xQueueReset(usb_app_event_queue);
+    vQueueDelete(usb_app_event_queue);
 }

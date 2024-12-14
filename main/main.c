@@ -1,8 +1,9 @@
 #include <nvs_flash.h>
 #include <stdio.h>
 #include "esp_hidd.h"
+#include "usb_app/usb_app.h"
 
-int main(void) {
+int app_main(void) {
     // Initialize NVS
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -10,6 +11,8 @@ int main(void) {
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+
+    usb_init();
 
     return 0;
 }

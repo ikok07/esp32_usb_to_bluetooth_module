@@ -69,6 +69,12 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
             ESP_LOGI(TAG, "ESP_HIDD_EVENT_BLE_LED_REPORT_WRITE_EVT");
             // To be developed...
             break;
+        case ESP_BAT_EVENT_REG:
+            break;
+        case ESP_HIDD_EVENT_DEINIT_FINISH:
+            break;
+        default:
+            break;;
     }
 }
 
