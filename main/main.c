@@ -1,6 +1,5 @@
 #include <nvs_flash.h>
-#include <stdio.h>
-#include "esp_hidd.h"
+#include "bt_app/bt_app.h"
 #include "usb_app/usb_app.h"
 
 int app_main(void) {
@@ -12,7 +11,7 @@ int app_main(void) {
     }
     ESP_ERROR_CHECK(err);
 
-    usb_init();
-
+    // usb_init();
+    bt_app_init();
     return 0;
 }
